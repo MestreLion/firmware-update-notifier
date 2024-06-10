@@ -1,0 +1,114 @@
+#!/bin/bash
+#
+# firmware-update-notifier - Universal firmware update notifier for devices
+#
+# This file is part of Universal Firmware Update Notifier,
+# see <https://github.com/MestreLion/firmware-update-notifier>
+# Copyright (C) 2024 Rodrigo Silva (MestreLion) <linux@rodrigosilva.com>
+# License: GPLv3 or later, at your choice. See <http://www.gnu.org/licenses/gpl>
+#------------------------------------------------------------------------------
+
+set -Eeuo pipefail  # exit on any error
+trap '>&2 echo "error: line $LINENO, status $?: $BASH_COMMAND"' ERR
+
+#------------------------------------------------------------------------------
+self=${0##*/}
+here=$(dirname "$(readlink -f "$0")")
+
+xml_tag() { awk -F '[<>]' -v tag="$1" '$2 ~ tag {print $3}' "$stdout"; }
+now()     { date --rfc-3339=seconds; }
+exists()  { type "$@" >/dev/null 2>&1; }
+require() {
+	local cmd=$1
+	local pkg=${2:-$cmd}
+	local msg='' eol=''
+	if exists "$cmd"; then return; fi
+	if [[ -x /usr/lib/command-not-found ]]; then
+		/usr/lib/command-not-found -- "$cmd" || true
+		eol='\n'
+	else
+		echo "Required command '${cmd}' is not installed." >&2
+		if [[ "$pkg" != '-' ]]; then
+			msg="with:\n\tsudo apt install ${pkg}\n"
+		fi
+	fi
+	echo -e "Please install ${cmd} ${msg}and try again.${eol}" >&2
+	exit 1
+}
+
+#------------------------------------------------------------------------------
+
+require uscan devscripts
+
+if shopt -q nullglob; then restore=0; else shopt -s nullglob; restore=1; fi
+watchfiles=( {"${XDG_CONFIG_HOME:-"$HOME"/.config}",/etc,"$here"}/"$self".d/*.conf )
+if ((restore)); then shopt -u nullglob; fi
+
+destroot=$here/downloads
+tmpdir=$(mktemp --directory)
+trap 'rm -rf -- "$tmpdir"' EXIT
+
+stderr=$tmpdir/stderr.txt
+stdout=$tmpdir/stdout.txt
+
+errfile=$destroot/errors.txt
+newfile=$destroot/new.txt
+
+mkdir -p -- "$destroot"
+
+# ------
+
+watchfile=${watchfiles[0]}
+device=$(basename "${watchfile%.conf}")
+version=$(grep -Pom1 '^#\s*VERSION\s*:\s*\K.*' "$watchfile" || echo "0")
+destdir=$destroot/$device
+mkdir -p -- "$destdir"
+
+# -----
+
+params=(
+	--no-conf
+	--destdir "$destdir"
+	--watchfile "$watchfile"
+	--package "$device"
+	--upstream-version "$version"
+
+	--safe  # turns off download, signature and repacking
+	# --skip-signature erroneously nullifies --force-download,
+	#  and --no-signature is broken, see
+	# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=/926429
+	--download
+
+	"$@"
+)
+
+# If "already up to date", uscan exits with code 0 on --download
+# and 1 on --force-download, the same code as an actual error.
+# So better to check "up to date" regardless of exit status
+# so we don't rely on a particular download option
+
+code=0
+uscan "${params[@]}" >"$stdout" 2>"$stderr" || code=$?
+if ((code)); then
+	# Check if "already up to date" or actual error
+	if [[ -s "$stderr" ]]; then
+		# Log error and exit with error code
+		if [[ -s "$errfile" ]]; then echo >> "$errfile"; fi
+		now >> "$errfile"
+		tee < "$stderr" -a "$errfile" >&2
+		exit $code
+	fi
+	# exit successfully if just "already up to date" and no actual error
+	exit
+fi
+
+# Check if "already up to date" or "newer version available"
+if [[ -s "$stdout" ]]; then
+	# Log newer version found, if needed
+	if ! grep -qsFxf <(head -n1 "$stdout") "$newfile"; then
+		if [[ -s "$newfile" ]]; then echo >> "$newfile"; fi
+		now >> "$newfile"
+		cat "$stdout" >> "$newfile"
+	fi
+	cat "$stdout"
+fi
