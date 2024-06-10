@@ -15,7 +15,10 @@ trap '>&2 echo "error: line $LINENO, status $?: $BASH_COMMAND"' ERR
 self=${0##*/}
 here=$(dirname "$(readlink -f "$0")")
 
-xml_tag() { awk -F '[<>]' -v tag="$1" '$2 ~ tag {print $3}' "$stdout"; }
+bold()    { tput bold; echo "$@"; tput sgr0; }
+red()     { tput setaf 1; bold "$@"; }
+green()   { tput setaf 2; bold "$@"; }
+message() { green '* ' "$@"; }
 now()     { date --rfc-3339=seconds; }
 exists()  { type "$@" >/dev/null 2>&1; }
 require() {
@@ -40,6 +43,16 @@ require() {
 
 require uscan devscripts
 
+params=(
+	--no-conf
+	--safe  # turns off download, signature and repacking
+	# --skip-signature erroneously nullifies --force-download,
+	#  and --no-signature is broken, see
+	# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=/926429
+	--force-download
+	"$@"
+)
+
 if shopt -q nullglob; then restore=0; else shopt -s nullglob; restore=1; fi
 watchfiles=( {"${XDG_CONFIG_HOME:-"$HOME"/.config}",/etc,"$here"}/"$self".d/*.conf )
 if ((restore)); then shopt -u nullglob; fi
@@ -58,57 +71,49 @@ mkdir -p -- "$destroot"
 
 # ------
 
-watchfile=${watchfiles[0]}
-device=$(basename "${watchfile%.conf}")
-version=$(grep -Pom1 '^#\s*VERSION\s*:\s*\K.*' "$watchfile" || echo "0")
-destdir=$destroot/$device
-mkdir -p -- "$destdir"
+declare -i exit_code=0
+for watchfile in "${watchfiles[@]}"; do
+	device=$(basename "${watchfile%.conf}")
+	version=$(grep -Pom1 '^#\s*VERSION\s*:\s*\K.*' "$watchfile" || echo "0")
+	destdir=$destroot/$device
+	mkdir -p -- "$destdir"
 
-# -----
+	device_params=(
+		--destdir "$destdir"
+		--watchfile "$watchfile"
+		--package "$device"
+		--upstream-version "$version"
+	)
+	message "${device}: ${version}"
 
-params=(
-	--no-conf
-	--destdir "$destdir"
-	--watchfile "$watchfile"
-	--package "$device"
-	--upstream-version "$version"
+	# If "already up to date", uscan exits with code 0 on --download
+	# and 1 on --force-download, the same code as an actual error.
+	# So better to check "up to date" regardless of exit status
+	# so we don't rely on a particular download option
 
-	--safe  # turns off download, signature and repacking
-	# --skip-signature erroneously nullifies --force-download,
-	#  and --no-signature is broken, see
-	# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=/926429
-	--download
-
-	"$@"
-)
-
-# If "already up to date", uscan exits with code 0 on --download
-# and 1 on --force-download, the same code as an actual error.
-# So better to check "up to date" regardless of exit status
-# so we don't rely on a particular download option
-
-code=0
-uscan "${params[@]}" >"$stdout" 2>"$stderr" || code=$?
-if ((code)); then
-	# Check if "already up to date" or actual error
-	if [[ -s "$stderr" ]]; then
-		# Log error and exit with error code
-		if [[ -s "$errfile" ]]; then echo >> "$errfile"; fi
-		now >> "$errfile"
-		tee < "$stderr" -a "$errfile" >&2
-		exit $code
+	code=0
+	uscan "${params[@]}" "${device_params[@]}" "$@" >"$stdout" 2>"$stderr" || code=$?
+	if ((code)); then
+		# Check if "already up to date" or actual error
+		if [[ -s "$stderr" ]]; then
+			# Log error and set error code
+			if [[ -s "$errfile" ]]; then echo >> "$errfile"; fi
+			now >> "$errfile"
+			tee < "$stderr" -a "$errfile" >&2
+			exit_code+=$code
+		fi
+		continue
 	fi
-	# exit successfully if just "already up to date" and no actual error
-	exit
-fi
 
-# Check if "already up to date" or "newer version available"
-if [[ -s "$stdout" ]]; then
-	# Log newer version found, if needed
-	if ! grep -qsFxf <(head -n1 "$stdout") "$newfile"; then
-		if [[ -s "$newfile" ]]; then echo >> "$newfile"; fi
-		now >> "$newfile"
-		cat "$stdout" >> "$newfile"
+	# Check if "already up to date" or "newer version available"
+	if [[ -s "$stdout" ]]; then
+		# Log newer version found, if needed
+		if ! grep -qsFxf <(head -n1 "$stdout") "$newfile"; then
+			if [[ -s "$newfile" ]]; then echo >> "$newfile"; fi
+			now >> "$newfile"
+			cat "$stdout" >> "$newfile"
+		fi
+		cat "$stdout"
 	fi
-	cat "$stdout"
-fi
+done
+exit $exit_code
