@@ -1,1 +1,6 @@
 downloads/*
+
+# Binary DEB generated from *.deb.cfg
+*.deb
+*.buildinfo
+*.changes
